@@ -1,4 +1,4 @@
-// Copyright 2013, 2014, 2015, 2016, 2017 Lovell Fuller and contributors.
+// Copyright 2013, 2014, 2015, 2016, 2017, 2018, 2019 Lovell Fuller and contributors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,6 +21,8 @@
 #include <tuple>
 #include <utility>
 #include <vector>
+#include <sys/types.h>
+#include <sys/stat.h>
 
 #include <vips/vips8>
 #include <node.h>
@@ -29,6 +31,20 @@
 #include "common.h"
 #include "operations.h"
 #include "pipeline.h"
+
+#if defined(WIN32)
+#define STAT64_STRUCT __stat64
+#define STAT64_FUNCTION _stat64
+#elif defined(__APPLE__)
+#define STAT64_STRUCT stat
+#define STAT64_FUNCTION stat
+#elif defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__) || defined(__DragonFly__)
+#define STAT64_STRUCT stat
+#define STAT64_FUNCTION stat
+#else
+#define STAT64_STRUCT stat64
+#define STAT64_FUNCTION stat64
+#endif
 
 class PipelineWorker : public Nan::AsyncWorker {
  public:
@@ -57,16 +73,6 @@ class PipelineWorker : public Nan::AsyncWorker {
     // Increment processing task counter
     g_atomic_int_inc(&sharp::counterProcess);
 
-    std::map<VipsInterpretation, std::string> profileMap;
-    // Default sRGB ICC profile from https://packages.debian.org/sid/all/icc-profiles-free/filelist
-    profileMap.insert(
-      std::pair<VipsInterpretation, std::string>(VIPS_INTERPRETATION_sRGB,
-                                                 baton->iccProfilePath + "sRGB.icc"));
-    // Convert to sRGB using default CMYK profile from http://www.argyllcms.com/cmyk.icm
-    profileMap.insert(
-      std::pair<VipsInterpretation, std::string>(VIPS_INTERPRETATION_CMYK,
-                                                 baton->iccProfilePath + "cmyk.icm"));
-
     try {
       // Open input
       vips::VImage image;
@@ -75,7 +81,8 @@ class PipelineWorker : public Nan::AsyncWorker {
 
       // Limit input images to a given number of pixels, where pixels = width * height
       // Ignore if 0
-      if (baton->limitInputPixels > 0 && image.width() * image.height() > baton->limitInputPixels) {
+      if (baton->limitInputPixels > 0 &&
+        static_cast<uint64_t>(image.width() * image.height()) > static_cast<uint64_t>(baton->limitInputPixels)) {
         (baton->err).append("Input image exceeds pixel limit");
         return Error();
       }
@@ -94,14 +101,23 @@ class PipelineWorker : public Nan::AsyncWorker {
       }
 
       // Rotate pre-extract
-      if (baton->rotateBeforePreExtract && rotation != VIPS_ANGLE_D0) {
-        image = image.rot(rotation);
-        sharp::RemoveExifOrientation(image);
+      if (baton->rotateBeforePreExtract) {
+        if (rotation != VIPS_ANGLE_D0) {
+          image = image.rot(rotation);
+          image = sharp::RemoveExifOrientation(image);
+        }
+        if (baton->rotationAngle != 0.0) {
+          std::vector<double> background;
+          std::tie(image, background) = sharp::ApplyAlpha(image, baton->rotationBackground);
+          image = image.rotate(baton->rotationAngle, VImage::option()->set("background", background));
+        }
       }
 
       // Trim
-      if (baton->trimTolerance != 0) {
-        image = sharp::Trim(image, baton->trimTolerance);
+      if (baton->trimThreshold > 0.0) {
+        image = sharp::Trim(image, baton->trimThreshold);
+        baton->trimOffsetLeft = image.xoffset();
+        baton->trimOffsetTop = image.yoffset();
       }
 
       // Pre extraction
@@ -233,7 +249,7 @@ class PipelineWorker : public Nan::AsyncWorker {
       if (
         xshrink == yshrink && xshrink >= 2 * shrink_on_load_factor &&
         (inputImageType == ImageType::JPEG || inputImageType == ImageType::WEBP) &&
-        baton->gamma == 0 && baton->topOffsetPre == -1 && baton->trimTolerance == 0
+        baton->gamma == 0 && baton->topOffsetPre == -1 && baton->trimThreshold == 0.0
       ) {
         if (xshrink >= 8 * shrink_on_load_factor) {
           xfactor = xfactor / 8;
@@ -281,32 +297,32 @@ class PipelineWorker : public Nan::AsyncWorker {
           }
         }
         // Recalculate integral shrink and double residual
-        int shrunkOnLoadWidth = image.width();
-        int shrunkOnLoadHeight = image.height();
+        int const shrunkOnLoadWidth = image.width();
+        int const shrunkOnLoadHeight = image.height();
         if (!baton->rotateBeforePreExtract &&
           (rotation == VIPS_ANGLE_D90 || rotation == VIPS_ANGLE_D270)) {
-          // Swap input output width and height when rotating by 90 or 270 degrees
-          std::swap(shrunkOnLoadWidth, shrunkOnLoadHeight);
+          // Swap when rotating by 90 or 270 degrees
+          xfactor = static_cast<double>(shrunkOnLoadWidth) / static_cast<double>(targetResizeHeight);
+          yfactor = static_cast<double>(shrunkOnLoadHeight) / static_cast<double>(targetResizeWidth);
+        } else {
+          xfactor = static_cast<double>(shrunkOnLoadWidth) / static_cast<double>(targetResizeWidth);
+          yfactor = static_cast<double>(shrunkOnLoadHeight) / static_cast<double>(targetResizeHeight);
         }
-        xfactor = static_cast<double>(shrunkOnLoadWidth) / static_cast<double>(targetResizeWidth);
-        yfactor = static_cast<double>(shrunkOnLoadHeight) / static_cast<double>(targetResizeHeight);
       }
 
       // Ensure we're using a device-independent colour space
-      if (sharp::HasProfile(image)) {
+      if (sharp::HasProfile(image) && image.interpretation() != VIPS_INTERPRETATION_LABS) {
         // Convert to sRGB using embedded profile
         try {
-          image = image.icc_transform(
-            const_cast<char*>(profileMap[VIPS_INTERPRETATION_sRGB].data()), VImage::option()
+          image = image.icc_transform("srgb", VImage::option()
             ->set("embedded", TRUE)
             ->set("intent", VIPS_INTENT_PERCEPTUAL));
         } catch(...) {
           // Ignore failure of embedded profile
         }
       } else if (image.interpretation() == VIPS_INTERPRETATION_CMYK) {
-        image = image.icc_transform(
-          const_cast<char*>(profileMap[VIPS_INTERPRETATION_sRGB].data()), VImage::option()
-          ->set("input_profile", profileMap[VIPS_INTERPRETATION_CMYK].data())
+        image = image.icc_transform("srgb", VImage::option()
+          ->set("input_profile", "cmyk")
           ->set("intent", VIPS_INTENT_PERCEPTUAL));
       }
 
@@ -316,9 +332,9 @@ class PipelineWorker : public Nan::AsyncWorker {
         double const multiplier = sharp::Is16Bit(image.interpretation()) ? 256.0 : 1.0;
         // Background colour
         std::vector<double> background {
-          baton->background[0] * multiplier,
-          baton->background[1] * multiplier,
-          baton->background[2] * multiplier
+          baton->flattenBackground[0] * multiplier,
+          baton->flattenBackground[1] * multiplier,
+          baton->flattenBackground[2] * multiplier
         };
         image = image.flatten(VImage::option()
           ->set("background", background));
@@ -339,30 +355,20 @@ class PipelineWorker : public Nan::AsyncWorker {
         image = image.colourspace(VIPS_INTERPRETATION_B_W);
       }
 
-      // Ensure image has an alpha channel when there is an overlay with an alpha channel
-      VImage overlayImage;
-      ImageType overlayImageType = ImageType::UNKNOWN;
-      bool shouldOverlayWithAlpha = FALSE;
-      if (baton->overlay != nullptr) {
-        std::tie(overlayImage, overlayImageType) = OpenInput(baton->overlay, baton->accessMethod);
-        if (HasAlpha(overlayImage)) {
-          shouldOverlayWithAlpha = !baton->overlayCutout;
-          if (!HasAlpha(image)) {
-            double const multiplier = sharp::Is16Bit(image.interpretation()) ? 256.0 : 1.0;
-            image = image.bandjoin(
-              VImage::new_matrix(image.width(), image.height()).new_from_image(255 * multiplier));
-          }
-        }
-      }
-
       bool const shouldResize = xfactor != 1.0 || yfactor != 1.0;
       bool const shouldBlur = baton->blurSigma != 0.0;
       bool const shouldConv = baton->convKernelWidth * baton->convKernelHeight > 0;
       bool const shouldSharpen = baton->sharpenSigma != 0.0;
       bool const shouldApplyMedian = baton->medianSize > 0;
+      bool const shouldComposite = !baton->composite.empty();
+      bool const shouldModulate = baton->brightness != 1.0 || baton->saturation != 1.0 || baton->hue != 0.0;
+
+      if (shouldComposite && !HasAlpha(image)) {
+        image = sharp::EnsureAlpha(image);
+      }
 
       bool const shouldPremultiplyAlpha = HasAlpha(image) &&
-        (shouldResize || shouldBlur || shouldConv || shouldSharpen || shouldOverlayWithAlpha);
+        (shouldResize || shouldBlur || shouldConv || shouldSharpen || shouldComposite);
 
       // Premultiply image alpha channel before all transformations to avoid
       // dark fringing around bright pixels
@@ -377,32 +383,41 @@ class PipelineWorker : public Nan::AsyncWorker {
           vips_enum_from_nick(nullptr, VIPS_TYPE_KERNEL, baton->kernel.data()));
         if (
           kernel != VIPS_KERNEL_NEAREST && kernel != VIPS_KERNEL_CUBIC && kernel != VIPS_KERNEL_LANCZOS2 &&
-          kernel != VIPS_KERNEL_LANCZOS3
+          kernel != VIPS_KERNEL_LANCZOS3 && kernel != VIPS_KERNEL_MITCHELL
         ) {
           throw vips::VError("Unknown kernel");
         }
-
+        // Ensure shortest edge is at least 1 pixel
+        if (image.width() / xfactor < 0.5) {
+          xfactor = 2 * image.width();
+          baton->width = 1;
+        }
+        if (image.height() / yfactor < 0.5) {
+          yfactor = 2 * image.height();
+          baton->height = 1;
+        }
         image = image.resize(1.0 / xfactor, VImage::option()
           ->set("vscale", 1.0 / yfactor)
           ->set("kernel", kernel));
       }
 
-      // Rotate
-      if (!baton->rotateBeforePreExtract && rotation != VIPS_ANGLE_D0) {
-        image = image.rot(rotation);
-        sharp::RemoveExifOrientation(image);
+      // Rotate post-extract 90-angle
+      if (!baton->rotateBeforePreExtract &&  rotation != VIPS_ANGLE_D0) {
+          image = image.rot(rotation);
+          image = sharp::RemoveExifOrientation(image);
       }
+
 
       // Flip (mirror about Y axis)
       if (baton->flip) {
         image = image.flip(VIPS_DIRECTION_VERTICAL);
-        sharp::RemoveExifOrientation(image);
+        image = sharp::RemoveExifOrientation(image);
       }
 
       // Flop (mirror about X axis)
       if (baton->flop) {
         image = image.flip(VIPS_DIRECTION_HORIZONTAL);
-        sharp::RemoveExifOrientation(image);
+        image = sharp::RemoveExifOrientation(image);
       }
 
       // Join additional color channels to the image
@@ -420,35 +435,8 @@ class PipelineWorker : public Nan::AsyncWorker {
       // Crop/embed
       if (image.width() != baton->width || image.height() != baton->height) {
         if (baton->canvas == Canvas::EMBED) {
-          // Scale up 8-bit values to match 16-bit input image
-          double const multiplier = sharp::Is16Bit(image.interpretation()) ? 256.0 : 1.0;
-          // Create background colour
           std::vector<double> background;
-          if (image.bands() > 2) {
-            background = {
-              multiplier * baton->background[0],
-              multiplier * baton->background[1],
-              multiplier * baton->background[2]
-            };
-          } else {
-            // Convert sRGB to greyscale
-            background = { multiplier * (
-              0.2126 * baton->background[0] +
-              0.7152 * baton->background[1] +
-              0.0722 * baton->background[2])
-            };
-          }
-          // Add alpha channel to background colour
-          if (baton->background[3] < 255.0 || HasAlpha(image)) {
-            background.push_back(baton->background[3] * multiplier);
-          }
-          // Ensure background colour uses correct colourspace
-          background = sharp::GetRgbaAsColourspace(background, image.interpretation());
-          // Add non-transparent alpha channel, if required
-          if (baton->background[3] < 255.0 && !HasAlpha(image)) {
-            image = image.bandjoin(
-              VImage::new_matrix(image.width(), image.height()).new_from_image(255 * multiplier));
-          }
+          std::tie(image, background) = sharp::ApplyAlpha(image, baton->resizeBackground);
 
           // Embed
 
@@ -462,7 +450,7 @@ class PipelineWorker : public Nan::AsyncWorker {
           int width = std::max(image.width(), baton->width);
           int height = std::max(image.height(), baton->height);
           std::tie(left, top) = sharp::CalculateEmbedPosition(
-            image.width(), image.height(), baton->width, baton->height, baton->embed);
+            image.width(), image.height(), baton->width, baton->height, baton->position);
 
           image = image.embed(left, top, width, height, VImage::option()
             ->set("extend", VIPS_EXTEND_BACKGROUND)
@@ -473,12 +461,12 @@ class PipelineWorker : public Nan::AsyncWorker {
           (image.width() > baton->width || image.height() > baton->height)
         ) {
           // Crop/max/min
-          if (baton->crop < 9) {
+          if (baton->position < 9) {
             // Gravity-based crop
             int left;
             int top;
             std::tie(left, top) = sharp::CalculateCrop(
-              image.width(), image.height(), baton->width, baton->height, baton->crop);
+              image.width(), image.height(), baton->width, baton->height, baton->position);
             int width = std::min(image.width(), baton->width);
             int height = std::min(image.height(), baton->height);
             image = image.extract_area(left, top, width, height);
@@ -494,12 +482,19 @@ class PipelineWorker : public Nan::AsyncWorker {
               ->set("access", baton->accessMethod)
               ->set("threaded", TRUE));
             image = image.smartcrop(baton->width, baton->height, VImage::option()
-              ->set("interesting", baton->crop == 16 ? VIPS_INTERESTING_ENTROPY : VIPS_INTERESTING_ATTENTION));
+              ->set("interesting", baton->position == 16 ? VIPS_INTERESTING_ENTROPY : VIPS_INTERESTING_ATTENTION));
             baton->hasCropOffset = true;
             baton->cropOffsetLeft = static_cast<int>(image.xoffset());
             baton->cropOffsetTop = static_cast<int>(image.yoffset());
           }
         }
+      }
+
+      // Rotate post-extract non-90 angle
+      if (!baton->rotateBeforePreExtract && baton->rotationAngle != 0.0) {
+        std::vector<double> background;
+        std::tie(image, background) = sharp::ApplyAlpha(image, baton->rotationBackground);
+        image = image.rotate(baton->rotationAngle, VImage::option()->set("background", background));
       }
 
       // Post extraction
@@ -510,35 +505,9 @@ class PipelineWorker : public Nan::AsyncWorker {
 
       // Extend edges
       if (baton->extendTop > 0 || baton->extendBottom > 0 || baton->extendLeft > 0 || baton->extendRight > 0) {
-        // Scale up 8-bit values to match 16-bit input image
-        double const multiplier = sharp::Is16Bit(image.interpretation()) ? 256.0 : 1.0;
-        // Create background colour
         std::vector<double> background;
-        if (image.bands() > 2) {
-          background = {
-            multiplier * baton->background[0],
-            multiplier * baton->background[1],
-            multiplier * baton->background[2]
-          };
-        } else {
-          // Convert sRGB to greyscale
-          background = { multiplier * (
-            0.2126 * baton->background[0] +
-            0.7152 * baton->background[1] +
-            0.0722 * baton->background[2])
-          };
-        }
-        // Add alpha channel to background colour
-        if (baton->background[3] < 255.0 || HasAlpha(image)) {
-          background.push_back(baton->background[3] * multiplier);
-        }
-        // Ensure background colour uses correct colourspace
-        background = sharp::GetRgbaAsColourspace(background, image.interpretation());
-        // Add non-transparent alpha channel, if required
-        if (baton->background[3] < 255.0 && !HasAlpha(image)) {
-          image = image.bandjoin(
-            VImage::new_matrix(image.width(), image.height()).new_from_image(255 * multiplier));
-        }
+        std::tie(image, background) = sharp::ApplyAlpha(image, baton->extendBackground);
+
         // Embed
         baton->width = image.width() + baton->extendLeft + baton->extendRight;
         baton->height = image.height() + baton->extendTop + baton->extendBottom;
@@ -568,77 +537,81 @@ class PipelineWorker : public Nan::AsyncWorker {
           baton->convKernel);
       }
 
+      // Recomb
+      if (baton->recombMatrix != NULL) {
+        image = sharp::Recomb(image, baton->recombMatrix);
+      }
+
+      if (shouldModulate) {
+        image = sharp::Modulate(image, baton->brightness, baton->saturation, baton->hue);
+      }
+
       // Sharpen
       if (shouldSharpen) {
         image = sharp::Sharpen(image, baton->sharpenSigma, baton->sharpenFlat, baton->sharpenJagged);
       }
 
-      // Composite with overlay, if present
-      if (baton->overlay != nullptr) {
-        // Verify overlay image is within current dimensions
-        if (overlayImage.width() > image.width() || overlayImage.height() > image.height()) {
-          throw vips::VError("Overlay image must have same dimensions or smaller");
-        }
-        // Check if overlay is tiled
-        if (baton->overlayTile) {
-          int const overlayImageWidth = overlayImage.width();
-          int const overlayImageHeight = overlayImage.height();
-          int across = 0;
-          int down = 0;
-          // Use gravity in overlay
-          if (overlayImageWidth <= baton->width) {
-            across = static_cast<int>(ceil(static_cast<double>(image.width()) / overlayImageWidth));
+      // Composite
+      if (shouldComposite) {
+        for (Composite *composite : baton->composite) {
+          VImage compositeImage;
+          ImageType compositeImageType = ImageType::UNKNOWN;
+          std::tie(compositeImage, compositeImageType) = OpenInput(composite->input, baton->accessMethod);
+          // Verify within current dimensions
+          if (compositeImage.width() > image.width() || compositeImage.height() > image.height()) {
+            throw vips::VError("Image to composite must have same dimensions or smaller");
           }
-          if (overlayImageHeight <= baton->height) {
-            down = static_cast<int>(ceil(static_cast<double>(image.height()) / overlayImageHeight));
-          }
-          if (across != 0 || down != 0) {
-            int left;
-            int top;
-            overlayImage = overlayImage.replicate(across, down);
-            if (baton->overlayXOffset >= 0 && baton->overlayYOffset >= 0) {
-              // the overlayX/YOffsets will now be used to CalculateCrop for extract_area
-              std::tie(left, top) = sharp::CalculateCrop(
-                overlayImage.width(), overlayImage.height(), image.width(), image.height(),
-                baton->overlayXOffset, baton->overlayYOffset);
-            } else {
-              // the overlayGravity will now be used to CalculateCrop for extract_area
-              std::tie(left, top) = sharp::CalculateCrop(
-                overlayImage.width(), overlayImage.height(), image.width(), image.height(), baton->overlayGravity);
+          // Check if overlay is tiled
+          if (composite->tile) {
+            int across = 0;
+            int down = 0;
+            // Use gravity in overlay
+            if (compositeImage.width() <= baton->width) {
+              across = static_cast<int>(ceil(static_cast<double>(image.width()) / compositeImage.width()));
             }
-            overlayImage = overlayImage.extract_area(left, top, image.width(), image.height());
-          }
-          // the overlayGravity was used for extract_area, therefore set it back to its default value of 0
-          baton->overlayGravity = 0;
-        }
-        if (baton->overlayCutout) {
-          // 'cut out' the image, premultiplication is not required
-          image = sharp::Cutout(overlayImage, image, baton->overlayGravity);
-        } else {
-          // Ensure overlay is sRGB
-          overlayImage = overlayImage.colourspace(VIPS_INTERPRETATION_sRGB);
-          // Ensure overlay matches premultiplication state
-          if (shouldPremultiplyAlpha) {
-            // Ensure overlay has alpha channel
-            if (!HasAlpha(overlayImage)) {
-              double const multiplier = sharp::Is16Bit(overlayImage.interpretation()) ? 256.0 : 1.0;
-              overlayImage = overlayImage.bandjoin(
-                VImage::new_matrix(overlayImage.width(), overlayImage.height()).new_from_image(255 * multiplier));
+            if (compositeImage.height() <= baton->height) {
+              down = static_cast<int>(ceil(static_cast<double>(image.height()) / compositeImage.height()));
             }
-            overlayImage = overlayImage.premultiply();
+            if (across != 0 || down != 0) {
+              int left;
+              int top;
+              compositeImage = compositeImage.replicate(across, down);
+              if (composite->left >= 0 && composite->top >= 0) {
+                std::tie(left, top) = sharp::CalculateCrop(
+                  compositeImage.width(), compositeImage.height(), image.width(), image.height(),
+                  composite->left, composite->top);
+              } else {
+                std::tie(left, top) = sharp::CalculateCrop(
+                  compositeImage.width(), compositeImage.height(), image.width(), image.height(), composite->gravity);
+              }
+              compositeImage = compositeImage.extract_area(left, top, image.width(), image.height());
+            }
+            // gravity was used for extract_area, set it back to its default value of 0
+            composite->gravity = 0;
           }
+          // Ensure image to composite is sRGB with premultiplied alpha
+          compositeImage = compositeImage.colourspace(VIPS_INTERPRETATION_sRGB);
+          if (!HasAlpha(compositeImage)) {
+            compositeImage = sharp::EnsureAlpha(compositeImage);
+          }
+          if (!composite->premultiplied) compositeImage = compositeImage.premultiply();
+          // Calculate position
           int left;
           int top;
-          if (baton->overlayXOffset >= 0 && baton->overlayYOffset >= 0) {
-            // Composite images at given offsets
+          if (composite->left >= 0 && composite->top >= 0) {
+            // Composite image at given offsets
             std::tie(left, top) = sharp::CalculateCrop(image.width(), image.height(),
-              overlayImage.width(), overlayImage.height(), baton->overlayXOffset, baton->overlayYOffset);
+              compositeImage.width(), compositeImage.height(), composite->left, composite->top);
           } else {
-            // Composite images with given gravity
+            // Composite image with given gravity
             std::tie(left, top) = sharp::CalculateCrop(image.width(), image.height(),
-              overlayImage.width(), overlayImage.height(), baton->overlayGravity);
+              compositeImage.width(), compositeImage.height(), composite->gravity);
           }
-          image = sharp::Composite(image, overlayImage, left, top);
+          // Composite
+          image = image.composite2(compositeImage, composite->mode, VImage::option()
+            ->set("premultiplied", TRUE)
+            ->set("x", left)
+            ->set("y", top));
         }
       }
 
@@ -655,8 +628,8 @@ class PipelineWorker : public Nan::AsyncWorker {
       baton->premultiplied = shouldPremultiplyAlpha;
 
       // Gamma decoding (brighten)
-      if (baton->gamma >= 1 && baton->gamma <= 3) {
-        image = sharp::Gamma(image, baton->gamma);
+      if (baton->gammaOut >= 1 && baton->gammaOut <= 3) {
+        image = sharp::Gamma(image, baton->gammaOut);
       }
 
       // Linear adjustment (a * in + b)
@@ -683,7 +656,7 @@ class PipelineWorker : public Nan::AsyncWorker {
       }
 
       // Tint the image
-      if (baton->tintA > 0 || baton->tintB > 0) {
+      if (baton->tintA < 128.0 || baton->tintB < 128.0) {
         image = sharp::Tint(image, baton->tintA, baton->tintB);
       }
 
@@ -693,8 +666,24 @@ class PipelineWorker : public Nan::AsyncWorker {
           (baton->err).append("Cannot extract channel from image. Too few channels in image.");
           return Error();
         }
-        image = image.extract_band(baton->extractChannel);
+        VipsInterpretation const interpretation = sharp::Is16Bit(image.interpretation())
+          ? VIPS_INTERPRETATION_GREY16
+          : VIPS_INTERPRETATION_B_W;
+        image = image
+          .extract_band(baton->extractChannel)
+          .copy(VImage::option()->set("interpretation", interpretation));
       }
+
+      // Remove alpha channel, if any
+      if (baton->removeAlpha) {
+        image = sharp::RemoveAlpha(image);
+      }
+
+      // Ensure alpha channel, if missing
+      if (baton->ensureAlpha) {
+        image = sharp::EnsureAlpha(image);
+      }
+
       // Convert image to sRGB, if not already
       if (sharp::Is16Bit(image.interpretation())) {
         image = image.cast(VIPS_FORMAT_USHORT);
@@ -703,15 +692,15 @@ class PipelineWorker : public Nan::AsyncWorker {
         // Convert colourspace, pass the current known interpretation so libvips doesn't have to guess
         image = image.colourspace(baton->colourspace, VImage::option()->set("source_space", image.interpretation()));
         // Transform colours from embedded profile to output profile
-        if (baton->withMetadata && sharp::HasProfile(image) && profileMap[baton->colourspace] != std::string()) {
-          image = image.icc_transform(const_cast<char*>(profileMap[baton->colourspace].data()),
+        if (baton->withMetadata && sharp::HasProfile(image)) {
+          image = image.icc_transform(vips_enum_nick(VIPS_TYPE_INTERPRETATION, baton->colourspace),
             VImage::option()->set("embedded", TRUE));
         }
       }
 
       // Override EXIF Orientation tag
       if (baton->withMetadata && baton->withMetadataOrientation != -1) {
-        sharp::SetExifOrientation(image, baton->withMetadataOrientation);
+        image = sharp::SetExifOrientation(image, baton->withMetadataOrientation);
       }
 
       // Number of channels used in output image
@@ -730,9 +719,10 @@ class PipelineWorker : public Nan::AsyncWorker {
             ->set("interlace", baton->jpegProgressive)
             ->set("no_subsample", baton->jpegChromaSubsampling == "4:4:4")
             ->set("trellis_quant", baton->jpegTrellisQuantisation)
+            ->set("quant_table", baton->jpegQuantisationTable)
             ->set("overshoot_deringing", baton->jpegOvershootDeringing)
             ->set("optimize_scans", baton->jpegOptimiseScans)
-            ->set("optimize_coding", TRUE)));
+            ->set("optimize_coding", baton->jpegOptimiseCoding)));
           baton->bufferOut = static_cast<char*>(area->data);
           baton->bufferOutLength = area->length;
           area->free_fn = nullptr;
@@ -747,14 +737,15 @@ class PipelineWorker : public Nan::AsyncWorker {
           (inputImageType == ImageType::PNG || inputImageType == ImageType::GIF || inputImageType == ImageType::SVG))) {
           // Write PNG to buffer
           sharp::AssertImageTypeDimensions(image, ImageType::PNG);
-          // Strip profile
-          if (!baton->withMetadata) {
-            vips_image_remove(image.get_image(), VIPS_META_ICC_NAME);
-          }
           VipsArea *area = VIPS_AREA(image.pngsave_buffer(VImage::option()
+            ->set("strip", !baton->withMetadata)
             ->set("interlace", baton->pngProgressive)
             ->set("compression", baton->pngCompressionLevel)
-            ->set("filter", baton->pngAdaptiveFiltering ? VIPS_FOREIGN_PNG_FILTER_ALL : VIPS_FOREIGN_PNG_FILTER_NONE)));
+            ->set("filter", baton->pngAdaptiveFiltering ? VIPS_FOREIGN_PNG_FILTER_ALL : VIPS_FOREIGN_PNG_FILTER_NONE)
+            ->set("palette", baton->pngPalette)
+            ->set("Q", baton->pngQuality)
+            ->set("colours", baton->pngColours)
+            ->set("dither", baton->pngDither)));
           baton->bufferOut = static_cast<char*>(area->data);
           baton->bufferOutLength = area->length;
           area->free_fn = nullptr;
@@ -768,6 +759,8 @@ class PipelineWorker : public Nan::AsyncWorker {
             ->set("Q", baton->webpQuality)
             ->set("lossless", baton->webpLossless)
             ->set("near_lossless", baton->webpNearLossless)
+            ->set("smart_subsample", baton->webpSmartSubsample)
+            ->set("reduction_effort", baton->webpReductionEffort)
             ->set("alpha_q", baton->webpAlphaQuality)));
           baton->bufferOut = static_cast<char*>(area->data);
           baton->bufferOutLength = area->length;
@@ -789,6 +782,10 @@ class PipelineWorker : public Nan::AsyncWorker {
             ->set("squash", baton->tiffSquash)
             ->set("compression", baton->tiffCompression)
             ->set("predictor", baton->tiffPredictor)
+            ->set("pyramid", baton->tiffPyramid)
+            ->set("tile", baton->tiffTile)
+            ->set("tile_height", baton->tiffTileHeight)
+            ->set("tile_width", baton->tiffTileWidth)
             ->set("xres", baton->tiffXres)
             ->set("yres", baton->tiffYres)));
           baton->bufferOut = static_cast<char*>(area->data);
@@ -797,11 +794,24 @@ class PipelineWorker : public Nan::AsyncWorker {
           vips_area_unref(area);
           baton->formatOut = "tiff";
           baton->channels = std::min(baton->channels, 3);
+        } else if (baton->formatOut == "heif" || (baton->formatOut == "input" && inputImageType == ImageType::HEIF)) {
+          // Write HEIF to buffer
+          VipsArea *area = VIPS_AREA(image.heifsave_buffer(VImage::option()
+            ->set("strip", !baton->withMetadata)
+            ->set("compression", baton->heifCompression)
+            ->set("Q", baton->heifQuality)
+            ->set("lossless", baton->heifLossless)));
+          baton->bufferOut = static_cast<char*>(area->data);
+          baton->bufferOutLength = area->length;
+          area->free_fn = nullptr;
+          vips_area_unref(area);
+          baton->formatOut = "heif";
         } else if (baton->formatOut == "raw" || (baton->formatOut == "input" && inputImageType == ImageType::RAW)) {
           // Write raw, uncompressed image data to buffer
           if (baton->greyscale || image.interpretation() == VIPS_INTERPRETATION_B_W) {
             // Extract first band for greyscale image
             image = image[0];
+            baton->channels = 1;
           }
           if (image.format() != VIPS_FORMAT_UCHAR) {
             // Cast pixels to uint8 (unsigned char)
@@ -830,6 +840,7 @@ class PipelineWorker : public Nan::AsyncWorker {
         bool const isPng = sharp::IsPng(baton->fileOut);
         bool const isWebp = sharp::IsWebp(baton->fileOut);
         bool const isTiff = sharp::IsTiff(baton->fileOut);
+        bool const isHeif = sharp::IsHeif(baton->fileOut);
         bool const isDz = sharp::IsDz(baton->fileOut);
         bool const isDzZip = sharp::IsDzZip(baton->fileOut);
         bool const isV = sharp::IsV(baton->fileOut);
@@ -845,23 +856,25 @@ class PipelineWorker : public Nan::AsyncWorker {
             ->set("interlace", baton->jpegProgressive)
             ->set("no_subsample", baton->jpegChromaSubsampling == "4:4:4")
             ->set("trellis_quant", baton->jpegTrellisQuantisation)
+            ->set("quant_table", baton->jpegQuantisationTable)
             ->set("overshoot_deringing", baton->jpegOvershootDeringing)
             ->set("optimize_scans", baton->jpegOptimiseScans)
-            ->set("optimize_coding", TRUE));
+            ->set("optimize_coding", baton->jpegOptimiseCoding));
           baton->formatOut = "jpeg";
           baton->channels = std::min(baton->channels, 3);
         } else if (baton->formatOut == "png" || (mightMatchInput && isPng) || (willMatchInput &&
           (inputImageType == ImageType::PNG || inputImageType == ImageType::GIF || inputImageType == ImageType::SVG))) {
           // Write PNG to file
           sharp::AssertImageTypeDimensions(image, ImageType::PNG);
-          // Strip profile
-          if (!baton->withMetadata) {
-            vips_image_remove(image.get_image(), VIPS_META_ICC_NAME);
-          }
           image.pngsave(const_cast<char*>(baton->fileOut.data()), VImage::option()
+            ->set("strip", !baton->withMetadata)
             ->set("interlace", baton->pngProgressive)
             ->set("compression", baton->pngCompressionLevel)
-            ->set("filter", baton->pngAdaptiveFiltering ? VIPS_FOREIGN_PNG_FILTER_ALL : VIPS_FOREIGN_PNG_FILTER_NONE));
+            ->set("filter", baton->pngAdaptiveFiltering ? VIPS_FOREIGN_PNG_FILTER_ALL : VIPS_FOREIGN_PNG_FILTER_NONE)
+            ->set("palette", baton->pngPalette)
+            ->set("Q", baton->pngQuality)
+            ->set("colours", baton->pngColours)
+            ->set("dither", baton->pngDither));
           baton->formatOut = "png";
         } else if (baton->formatOut == "webp" || (mightMatchInput && isWebp) ||
           (willMatchInput && inputImageType == ImageType::WEBP)) {
@@ -872,6 +885,8 @@ class PipelineWorker : public Nan::AsyncWorker {
             ->set("Q", baton->webpQuality)
             ->set("lossless", baton->webpLossless)
             ->set("near_lossless", baton->webpNearLossless)
+            ->set("smart_subsample", baton->webpSmartSubsample)
+            ->set("reduction_effort", baton->webpReductionEffort)
             ->set("alpha_q", baton->webpAlphaQuality));
           baton->formatOut = "webp";
         } else if (baton->formatOut == "tiff" || (mightMatchInput && isTiff) ||
@@ -880,20 +895,34 @@ class PipelineWorker : public Nan::AsyncWorker {
           if (baton->tiffCompression == VIPS_FOREIGN_TIFF_COMPRESSION_JPEG) {
             sharp::AssertImageTypeDimensions(image, ImageType::JPEG);
           }
-          // Cast pixel values to float, if required
-          if (baton->tiffPredictor == VIPS_FOREIGN_TIFF_PREDICTOR_FLOAT) {
-            image = image.cast(VIPS_FORMAT_FLOAT);
-          }
           image.tiffsave(const_cast<char*>(baton->fileOut.data()), VImage::option()
             ->set("strip", !baton->withMetadata)
             ->set("Q", baton->tiffQuality)
             ->set("squash", baton->tiffSquash)
             ->set("compression", baton->tiffCompression)
             ->set("predictor", baton->tiffPredictor)
+            ->set("pyramid", baton->tiffPyramid)
+            ->set("tile", baton->tiffTile)
+            ->set("tile_height", baton->tiffTileHeight)
+            ->set("tile_width", baton->tiffTileWidth)
             ->set("xres", baton->tiffXres)
             ->set("yres", baton->tiffYres));
           baton->formatOut = "tiff";
           baton->channels = std::min(baton->channels, 3);
+        } else if (baton->formatOut == "heif" || (mightMatchInput && isHeif) ||
+          (willMatchInput && inputImageType == ImageType::HEIF)) {
+          // Write HEIF to file
+          #ifdef VIPS_TYPE_FOREIGN_HEIF_COMPRESSION
+          if (sharp::IsAvif(baton->fileOut)) {
+            baton->heifCompression = VIPS_FOREIGN_HEIF_COMPRESSION_AV1;
+          }
+          #endif
+          image.heifsave(const_cast<char*>(baton->fileOut.data()), VImage::option()
+            ->set("strip", !baton->withMetadata)
+            ->set("Q", baton->heifQuality)
+            ->set("compression", baton->heifCompression)
+            ->set("lossless", baton->heifLossless));
+          baton->formatOut = "heif";
         } else if (baton->formatOut == "dz" || isDz || isDzZip) {
           if (isDzZip) {
             baton->tileContainer = VIPS_FOREIGN_DZ_CONTAINER_ZIP;
@@ -912,7 +941,9 @@ class PipelineWorker : public Nan::AsyncWorker {
               {"Q", std::to_string(baton->webpQuality)},
               {"alpha_q", std::to_string(baton->webpAlphaQuality)},
               {"lossless", baton->webpLossless ? "TRUE" : "FALSE"},
-              {"near_lossless", baton->webpNearLossless ? "TRUE" : "FALSE"}
+              {"near_lossless", baton->webpNearLossless ? "TRUE" : "FALSE"},
+              {"smart_subsample", baton->webpSmartSubsample ? "TRUE" : "FALSE"},
+              {"reduction_effort", std::to_string(baton->webpReductionEffort)}
             };
             suffix = AssembleSuffixString(".webp", options);
           } else {
@@ -924,21 +955,37 @@ class PipelineWorker : public Nan::AsyncWorker {
               {"interlace", baton->jpegProgressive ? "TRUE" : "FALSE"},
               {"no_subsample", baton->jpegChromaSubsampling == "4:4:4" ? "TRUE": "FALSE"},
               {"trellis_quant", baton->jpegTrellisQuantisation ? "TRUE" : "FALSE"},
+              {"quant_table", std::to_string(baton->jpegQuantisationTable)},
               {"overshoot_deringing", baton->jpegOvershootDeringing ? "TRUE": "FALSE"},
               {"optimize_scans", baton->jpegOptimiseScans ? "TRUE": "FALSE"},
-              {"optimize_coding", "TRUE"}
+              {"optimize_coding", baton->jpegOptimiseCoding ? "TRUE": "FALSE"}
             };
             suffix = AssembleSuffixString(extname, options);
           }
+
+          // Remove alpha channel from tile background if image does not contain an alpha channel
+          if (!HasAlpha(image)) {
+            baton->tileBackground.pop_back();
+          }
           // Write DZ to file
-          image.dzsave(const_cast<char*>(baton->fileOut.data()), VImage::option()
-            ->set("strip", !baton->withMetadata)
-            ->set("tile_size", baton->tileSize)
-            ->set("overlap", baton->tileOverlap)
-            ->set("container", baton->tileContainer)
-            ->set("layout", baton->tileLayout)
-            ->set("suffix", const_cast<char*>(suffix.data()))
-            ->set("angle", CalculateAngleRotation(baton->tileAngle)));
+          vips::VOption *options = VImage::option()
+                                       ->set("strip", !baton->withMetadata)
+                                       ->set("tile_size", baton->tileSize)
+                                       ->set("overlap", baton->tileOverlap)
+                                       ->set("container", baton->tileContainer)
+                                       ->set("layout", baton->tileLayout)
+                                       ->set("suffix", const_cast<char*>(suffix.data()))
+                                       ->set("angle", CalculateAngleRotation(baton->tileAngle))
+                                       ->set("background", baton->tileBackground)
+                                       ->set("skip_blanks", baton->tileSkipBlanks);
+
+          // libvips chooses a default depth based on layout. Instead of replicating that logic here by
+          // not passing anything - libvips will handle choice
+          if (baton->tileDepth < VIPS_FOREIGN_DZ_DEPTH_LAST) {
+            options->set("depth", baton->tileDepth);
+          }
+
+          image.dzsave(const_cast<char*>(baton->fileOut.data()), options);
           baton->formatOut = "dz";
         } else if (baton->formatOut == "v" || (mightMatchInput && isV) ||
           (willMatchInput && inputImageType == ImageType::VIPS)) {
@@ -993,6 +1040,12 @@ class PipelineWorker : public Nan::AsyncWorker {
         Set(info, New("cropOffsetTop").ToLocalChecked(),
           New<v8::Int32>(static_cast<int32_t>(baton->cropOffsetTop)));
       }
+      if (baton->trimThreshold > 0.0) {
+        Set(info, New("trimOffsetLeft").ToLocalChecked(),
+          New<v8::Int32>(static_cast<int32_t>(baton->trimOffsetLeft)));
+        Set(info, New("trimOffsetTop").ToLocalChecked(),
+          New<v8::Int32>(static_cast<int32_t>(baton->trimOffsetTop)));
+      }
 
       if (baton->bufferOutLength > 0) {
         // Pass ownership of output data to Buffer instance
@@ -1004,8 +1057,8 @@ class PipelineWorker : public Nan::AsyncWorker {
         argv[2] = info;
       } else {
         // Add file size to info
-        GStatBuf st;
-        if (g_stat(baton->fileOut.data(), &st) == 0) {
+        struct STAT64_STRUCT st;
+        if (STAT64_FUNCTION(baton->fileOut.data(), &st) == 0) {
           Set(info, New("size").ToLocalChecked(), New<v8::Uint32>(static_cast<uint32_t>(st.st_size)));
         }
         argv[1] = info;
@@ -1018,13 +1071,17 @@ class PipelineWorker : public Nan::AsyncWorker {
         GetFromPersistent(index);
         return index + 1;
       });
+
+    // Delete baton
     delete baton->input;
-    delete baton->overlay;
     delete baton->boolean;
-    for_each(baton->joinChannelIn.begin(), baton->joinChannelIn.end(),
-      [this](sharp::InputDescriptor *joinChannelIn) {
-        delete joinChannelIn;
-      });
+    for (Composite *composite : baton->composite) {
+      delete composite->input;
+      delete composite;
+    }
+    for (sharp::InputDescriptor *input : baton->joinChannelIn) {
+      delete input;
+    }
     delete baton;
 
     // Handle warnings
@@ -1124,6 +1181,7 @@ NAN_METHOD(pipeline) {
   using sharp::AttrTo;
   using sharp::AttrAs;
   using sharp::AttrAsStr;
+  using sharp::AttrAsRgba;
   using sharp::CreateInputDescriptor;
 
   // Input Buffers must not undergo GC compaction during processing
@@ -1135,9 +1193,6 @@ NAN_METHOD(pipeline) {
 
   // Input
   baton->input = CreateInputDescriptor(AttrAs<v8::Object>(options, "input"), buffersToPersist);
-
-  // ICC profile to use when input CMYK image has no embedded profile
-  baton->iccProfilePath = AttrAsStr(options, "iccProfilePath");
   baton->accessMethod = AttrTo<bool>(options, "sequentialRead") ?
     VIPS_ACCESS_SEQUENTIAL : VIPS_ACCESS_RANDOM;
   // Limit input images to a given number of pixels, where pixels = width * height
@@ -1167,27 +1222,30 @@ NAN_METHOD(pipeline) {
   } else if (canvas == "ignore_aspect") {
     baton->canvas = Canvas::IGNORE_ASPECT;
   }
-  // Background colour
-  v8::Local<v8::Object> background = AttrAs<v8::Object>(options, "background");
-  for (unsigned int i = 0; i < 4; i++) {
-    baton->background[i] = AttrTo<double>(background, i);
-  }
   // Tint chroma
   baton->tintA = AttrTo<double>(options, "tintA");
   baton->tintB = AttrTo<double>(options, "tintB");
-  // Overlay options
-  if (HasAttr(options, "overlay")) {
-    baton->overlay = CreateInputDescriptor(AttrAs<v8::Object>(options, "overlay"), buffersToPersist);
-    baton->overlayGravity = AttrTo<int32_t>(options, "overlayGravity");
-    baton->overlayXOffset = AttrTo<int32_t>(options, "overlayXOffset");
-    baton->overlayYOffset = AttrTo<int32_t>(options, "overlayYOffset");
-    baton->overlayTile = AttrTo<bool>(options, "overlayTile");
-    baton->overlayCutout = AttrTo<bool>(options, "overlayCutout");
+  // Composite
+  v8::Local<v8::Array> compositeArray = Nan::Get(options, Nan::New("composite").ToLocalChecked())
+    .ToLocalChecked().As<v8::Array>();
+  int const compositeArrayLength = AttrTo<uint32_t>(compositeArray, "length");
+  for (int i = 0; i < compositeArrayLength; i++) {
+    v8::Local<v8::Object> compositeObject = Nan::Get(compositeArray, i).ToLocalChecked().As<v8::Object>();
+    Composite *composite = new Composite;
+    composite->input = CreateInputDescriptor(AttrAs<v8::Object>(compositeObject, "input"), buffersToPersist);
+    composite->mode = static_cast<VipsBlendMode>(
+      vips_enum_from_nick(nullptr, VIPS_TYPE_BLEND_MODE, AttrAsStr(compositeObject, "blend").data()));
+    composite->gravity = AttrTo<uint32_t>(compositeObject, "gravity");
+    composite->left = AttrTo<int32_t>(compositeObject, "left");
+    composite->top = AttrTo<int32_t>(compositeObject, "top");
+    composite->tile = AttrTo<bool>(compositeObject, "tile");
+    composite->premultiplied = AttrTo<bool>(compositeObject, "premultiplied");
+    baton->composite.push_back(composite);
   }
   // Resize options
   baton->withoutEnlargement = AttrTo<bool>(options, "withoutEnlargement");
-  baton->crop = AttrTo<int32_t>(options, "crop");
-  baton->embed = AttrTo<int32_t>(options, "embed");
+  baton->position = AttrTo<int32_t>(options, "position");
+  baton->resizeBackground = AttrAsRgba(options, "resizeBackground");
   baton->kernel = AttrAsStr(options, "kernel");
   baton->fastShrinkOnLoad = AttrTo<bool>(options, "fastShrinkOnLoad");
   // Join Channel Options
@@ -1205,22 +1263,29 @@ NAN_METHOD(pipeline) {
   }
   // Operators
   baton->flatten = AttrTo<bool>(options, "flatten");
+  baton->flattenBackground = AttrAsRgba(options, "flattenBackground");
   baton->negate = AttrTo<bool>(options, "negate");
   baton->blurSigma = AttrTo<double>(options, "blurSigma");
+  baton->brightness = AttrTo<double>(options, "brightness");
+  baton->saturation = AttrTo<double>(options, "saturation");
+  baton->hue = AttrTo<int32_t>(options, "hue");
   baton->medianSize = AttrTo<uint32_t>(options, "medianSize");
   baton->sharpenSigma = AttrTo<double>(options, "sharpenSigma");
   baton->sharpenFlat = AttrTo<double>(options, "sharpenFlat");
   baton->sharpenJagged = AttrTo<double>(options, "sharpenJagged");
   baton->threshold = AttrTo<int32_t>(options, "threshold");
   baton->thresholdGrayscale = AttrTo<bool>(options, "thresholdGrayscale");
-  baton->trimTolerance = AttrTo<int32_t>(options, "trimTolerance");
+  baton->trimThreshold = AttrTo<double>(options, "trimThreshold");
   baton->gamma = AttrTo<double>(options, "gamma");
+  baton->gammaOut = AttrTo<double>(options, "gammaOut");
   baton->linearA = AttrTo<double>(options, "linearA");
   baton->linearB = AttrTo<double>(options, "linearB");
   baton->greyscale = AttrTo<bool>(options, "greyscale");
   baton->normalise = AttrTo<bool>(options, "normalise");
   baton->useExifOrientation = AttrTo<bool>(options, "useExifOrientation");
   baton->angle = AttrTo<int32_t>(options, "angle");
+  baton->rotationAngle = AttrTo<double>(options, "rotationAngle");
+  baton->rotationBackground = AttrAsRgba(options, "rotationBackground");
   baton->rotateBeforePreExtract = AttrTo<bool>(options, "rotateBeforePreExtract");
   baton->flip = AttrTo<bool>(options, "flip");
   baton->flop = AttrTo<bool>(options, "flop");
@@ -1228,7 +1293,11 @@ NAN_METHOD(pipeline) {
   baton->extendBottom = AttrTo<int32_t>(options, "extendBottom");
   baton->extendLeft = AttrTo<int32_t>(options, "extendLeft");
   baton->extendRight = AttrTo<int32_t>(options, "extendRight");
+  baton->extendBackground = AttrAsRgba(options, "extendBackground");
   baton->extractChannel = AttrTo<int32_t>(options, "extractChannel");
+
+  baton->removeAlpha = AttrTo<bool>(options, "removeAlpha");
+  baton->ensureAlpha = AttrTo<bool>(options, "ensureAlpha");
   if (HasAttr(options, "boolean")) {
     baton->boolean = CreateInputDescriptor(AttrAs<v8::Object>(options, "boolean"), buffersToPersist);
     baton->booleanOp = sharp::GetBooleanOperation(AttrAsStr(options, "booleanOp"));
@@ -1249,6 +1318,13 @@ NAN_METHOD(pipeline) {
       baton->convKernel[i] = AttrTo<double>(kdata, i);
     }
   }
+  if (HasAttr(options, "recombMatrix")) {
+    baton->recombMatrix = std::unique_ptr<double[]>(new double[9]);
+    v8::Local<v8::Array> recombMatrix = AttrAs<v8::Array>(options, "recombMatrix");
+    for (unsigned int i = 0; i < 9; i++) {
+       baton->recombMatrix[i] = AttrTo<double>(recombMatrix, i);
+    }
+  }
   baton->colourspace = sharp::GetInterpretation(AttrAsStr(options, "colourspace"));
   if (baton->colourspace == VIPS_INTERPRETATION_ERROR) {
     baton->colourspace = VIPS_INTERPRETATION_sRGB;
@@ -1263,17 +1339,29 @@ NAN_METHOD(pipeline) {
   baton->jpegProgressive = AttrTo<bool>(options, "jpegProgressive");
   baton->jpegChromaSubsampling = AttrAsStr(options, "jpegChromaSubsampling");
   baton->jpegTrellisQuantisation = AttrTo<bool>(options, "jpegTrellisQuantisation");
+  baton->jpegQuantisationTable = AttrTo<uint32_t>(options, "jpegQuantisationTable");
   baton->jpegOvershootDeringing = AttrTo<bool>(options, "jpegOvershootDeringing");
   baton->jpegOptimiseScans = AttrTo<bool>(options, "jpegOptimiseScans");
+  baton->jpegOptimiseCoding = AttrTo<bool>(options, "jpegOptimiseCoding");
   baton->pngProgressive = AttrTo<bool>(options, "pngProgressive");
   baton->pngCompressionLevel = AttrTo<uint32_t>(options, "pngCompressionLevel");
   baton->pngAdaptiveFiltering = AttrTo<bool>(options, "pngAdaptiveFiltering");
+  baton->pngPalette = AttrTo<bool>(options, "pngPalette");
+  baton->pngQuality = AttrTo<uint32_t>(options, "pngQuality");
+  baton->pngColours = AttrTo<uint32_t>(options, "pngColours");
+  baton->pngDither = AttrTo<double>(options, "pngDither");
   baton->webpQuality = AttrTo<uint32_t>(options, "webpQuality");
   baton->webpAlphaQuality = AttrTo<uint32_t>(options, "webpAlphaQuality");
   baton->webpLossless = AttrTo<bool>(options, "webpLossless");
   baton->webpNearLossless = AttrTo<bool>(options, "webpNearLossless");
+  baton->webpSmartSubsample = AttrTo<bool>(options, "webpSmartSubsample");
+  baton->webpReductionEffort = AttrTo<uint32_t>(options, "webpReductionEffort");
   baton->tiffQuality = AttrTo<uint32_t>(options, "tiffQuality");
+  baton->tiffPyramid = AttrTo<bool>(options, "tiffPyramid");
   baton->tiffSquash = AttrTo<bool>(options, "tiffSquash");
+  baton->tiffTile = AttrTo<bool>(options, "tiffTile");
+  baton->tiffTileWidth = AttrTo<uint32_t>(options, "tiffTileWidth");
+  baton->tiffTileHeight = AttrTo<uint32_t>(options, "tiffTileHeight");
   baton->tiffXres = AttrTo<double>(options, "tiffXres");
   baton->tiffYres = AttrTo<double>(options, "tiffYres");
   // tiff compression options
@@ -1283,12 +1371,20 @@ NAN_METHOD(pipeline) {
   baton->tiffPredictor = static_cast<VipsForeignTiffPredictor>(
   vips_enum_from_nick(nullptr, VIPS_TYPE_FOREIGN_TIFF_PREDICTOR,
     AttrAsStr(options, "tiffPredictor").data()));
-
+  baton->heifQuality = AttrTo<uint32_t>(options, "heifQuality");
+  baton->heifLossless = AttrTo<bool>(options, "heifLossless");
+  #ifdef VIPS_TYPE_FOREIGN_HEIF_COMPRESSION
+  baton->heifCompression = static_cast<VipsForeignHeifCompression>(
+  vips_enum_from_nick(nullptr, VIPS_TYPE_FOREIGN_HEIF_COMPRESSION,
+    AttrAsStr(options, "heifCompression").data()));
+  #endif
   // Tile output
   baton->tileSize = AttrTo<uint32_t>(options, "tileSize");
   baton->tileOverlap = AttrTo<uint32_t>(options, "tileOverlap");
   std::string tileContainer = AttrAsStr(options, "tileContainer");
   baton->tileAngle = AttrTo<int32_t>(options, "tileAngle");
+  baton->tileBackground = AttrAsRgba(options, "tileBackground");
+  baton->tileSkipBlanks = AttrTo<int32_t>(options, "tileSkipBlanks");
   if (tileContainer == "zip") {
     baton->tileContainer = VIPS_FOREIGN_DZ_CONTAINER_ZIP;
   } else {
@@ -1303,10 +1399,21 @@ NAN_METHOD(pipeline) {
     baton->tileLayout = VIPS_FOREIGN_DZ_LAYOUT_DZ;
   }
   baton->tileFormat = AttrAsStr(options, "tileFormat");
+  std::string tileDepth = AttrAsStr(options, "tileDepth");
+  if (tileDepth == "onetile") {
+    baton->tileDepth = VIPS_FOREIGN_DZ_DEPTH_ONETILE;
+  } else if (tileDepth == "one") {
+    baton->tileDepth = VIPS_FOREIGN_DZ_DEPTH_ONE;
+  } else if (tileDepth == "onepixel") {
+    baton->tileDepth = VIPS_FOREIGN_DZ_DEPTH_ONEPIXEL;
+  } else {
+    // signal that we do not want to pass any value to dzSave
+    baton->tileDepth = VIPS_FOREIGN_DZ_DEPTH_LAST;
+  }
   // Force random access for certain operations
   if (baton->accessMethod == VIPS_ACCESS_SEQUENTIAL && (
-    baton->trimTolerance != 0 || baton->normalise ||
-    baton->crop == 16 || baton->crop == 17)) {
+    baton->trimThreshold > 0.0 || baton->normalise ||
+    baton->position == 16 || baton->position == 17)) {
     baton->accessMethod = VIPS_ACCESS_RANDOM;
   }
 

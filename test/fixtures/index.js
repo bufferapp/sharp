@@ -13,10 +13,10 @@ const getPath = function (filename) {
 // Based on the dHash gradient method - see http://www.hackerfactor.com/blog/index.php?/archives/529-Kind-of-Like-That.html
 const fingerprint = function (image, callback) {
   sharp(image)
+    .flatten('gray')
     .greyscale()
     .normalise()
-    .resize(9, 8)
-    .ignoreAspectRatio()
+    .resize(9, 8, { fit: sharp.fit.fill })
     .raw()
     .toBuffer(function (err, data) {
       if (err) {
@@ -71,6 +71,7 @@ module.exports = {
   inputJpgCenteredImage: getPath('centered_image.jpeg'),
   inputJpgRandom: getPath('random.jpg'), // convert -size 200x200 xc:   +noise Random   random.jpg
   inputJpgThRandom: getPath('thRandom.jpg'), // convert random.jpg  -channel G -threshold 5% -separate +channel -negate thRandom.jpg
+  inputJpgLossless: getPath('testimgl.jpg'), // Lossless JPEG from ftp://ftp.fu-berlin.de/unix/X11/graphics/ImageMagick/delegates/ljpeg-6b.tar.gz
 
   inputPng: getPath('50020484-00001.png'), // http://c.searspartsdirect.com/lis_png/PLDM/50020484-00001.png
   inputPngWithTransparency: getPath('blackbug.png'), // public domain
@@ -80,9 +81,6 @@ module.exports = {
   inputPngWithTransparency16bit: getPath('tbgn2c16.png'), // http://www.schaik.com/pngsuite/tbgn2c16.png
   inputPngOverlayLayer0: getPath('alpha-layer-0-background.png'),
   inputPngOverlayLayer1: getPath('alpha-layer-1-fill.png'),
-  inputPngOverlayLayer2: getPath('alpha-layer-2-ink.png'),
-  inputPngOverlayLayer1LowAlpha: getPath('alpha-layer-1-fill-low-alpha.png'),
-  inputPngOverlayLayer2LowAlpha: getPath('alpha-layer-2-ink-low-alpha.png'),
   inputPngAlphaPremultiplicationSmall: getPath('alpha-premultiply-1024x768-paper.png'),
   inputPngAlphaPremultiplicationLarge: getPath('alpha-premultiply-2048x1536-paper.png'),
   inputPngBooleanNoAlpha: getPath('bandbool.png'),
@@ -90,6 +88,7 @@ module.exports = {
   inputPngTruncated: getPath('truncated.png'), // gm convert 2569067123_aca715a2ee_o.jpg -resize 320x240 saw.png ; head -c 10000 saw.png > truncated.png
   inputPngEmbed: getPath('embedgravitybird.png'), // Released to sharp under a CC BY 4.0
   inputPngRGBWithAlpha: getPath('2569067123_aca715a2ee_o.png'), // http://www.flickr.com/photos/grizdave/2569067123/ (same as inputJpg)
+  inputPngImageInAlpha: getPath('image-in-alpha.png'), // https://github.com/lovell/sharp/issues/1597
 
   inputWebP: getPath('4.webp'), // http://www.gstatic.com/webp/gallery/4.webp
   inputWebPWithTransparency: getPath('5_webp_a.webp'), // http://www.gstatic.com/webp/gallery3/5_webp_a.webp
@@ -98,8 +97,10 @@ module.exports = {
   inputTiffCielab: getPath('cielab-dagams.tiff'), // https://github.com/lovell/sharp/issues/646
   inputTiffUncompressed: getPath('uncompressed_tiff.tiff'), // https://code.google.com/archive/p/imagetestsuite/wikis/TIFFTestSuite.wiki file: 0c84d07e1b22b76f24cccc70d8788e4a.tif
   inputTiff8BitDepth: getPath('8bit_depth.tiff'),
+  inputTifftagPhotoshop: getPath('tifftag-photoshop.tiff'), // https://github.com/lovell/sharp/issues/1600
   inputGif: getPath('Crash_test.gif'), // http://upload.wikimedia.org/wikipedia/commons/e/e3/Crash_test.gif
   inputGifGreyPlusAlpha: getPath('grey-plus-alpha.gif'), // http://i.imgur.com/gZ5jlmE.gif
+  inputGifAnimated: getPath('rotating-squares.gif'), // CC0 https://loading.io/spinner/blocks/-rotating-squares-preloader-gif
   inputSvg: getPath('check.svg'), // http://dev.w3.org/SVG/tools/svgweb/samples/svg-files/check.svg
   inputSvgWithEmbeddedImages: getPath('struct-image-04-t.svg'), // https://dev.w3.org/SVG/profiles/1.2T/test/svg/struct-image-04-t.svg
 
@@ -118,6 +119,8 @@ module.exports = {
   outputV: getPath('output.v'),
   outputTiff: getPath('output.tiff'),
   outputZoinks: getPath('output.zoinks'), // an 'unknown' file extension
+
+  testPattern: getPath('test-pattern.png'),
 
   // Path for tests requiring human inspection
   path: getPath,

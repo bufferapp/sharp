@@ -1,4 +1,4 @@
-// Copyright 2013, 2014, 2015, 2016, 2017 Lovell Fuller and contributors.
+// Copyright 2013, 2014, 2015, 2016, 2017, 2018, 2019 Lovell Fuller and contributors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,7 +17,7 @@
 #include <string.h>
 #include <vector>
 #include <queue>
-#include <mutex>
+#include <mutex>  // NOLINT(build/c++11)
 
 #include <node.h>
 #include <node_buffer.h>
@@ -31,16 +31,24 @@ using vips::VImage;
 namespace sharp {
 
   // Convenience methods to access the attributes of a v8::Object
-  bool HasAttr(v8::Handle<v8::Object> obj, std::string attr) {
+  bool HasAttr(v8::Local<v8::Object> obj, std::string attr) {
     return Nan::Has(obj, Nan::New(attr).ToLocalChecked()).FromJust();
   }
-  std::string AttrAsStr(v8::Handle<v8::Object> obj, std::string attr) {
+  std::string AttrAsStr(v8::Local<v8::Object> obj, std::string attr) {
     return *Nan::Utf8String(Nan::Get(obj, Nan::New(attr).ToLocalChecked()).ToLocalChecked());
+  }
+  std::vector<double> AttrAsRgba(v8::Local<v8::Object> obj, std::string attr) {
+    v8::Local<v8::Object> background = AttrAs<v8::Object>(obj, attr);
+    std::vector<double> rgba(4);
+    for (unsigned int i = 0; i < 4; i++) {
+      rgba[i] = AttrTo<double>(background, i);
+    }
+    return rgba;
   }
 
   // Create an InputDescriptor instance from a v8::Object describing an input image
   InputDescriptor* CreateInputDescriptor(
-    v8::Handle<v8::Object> input, std::vector<v8::Local<v8::Object>> &buffersToPersist
+    v8::Local<v8::Object> input, std::vector<v8::Local<v8::Object>> &buffersToPersist
   ) {
     Nan::HandleScope();
     InputDescriptor *descriptor = new InputDescriptor;
@@ -50,12 +58,13 @@ namespace sharp {
       v8::Local<v8::Object> buffer = AttrAs<v8::Object>(input, "buffer");
       descriptor->bufferLength = node::Buffer::Length(buffer);
       descriptor->buffer = node::Buffer::Data(buffer);
+      descriptor->isBuffer = TRUE;
       buffersToPersist.push_back(buffer);
     }
     descriptor->failOnError = AttrTo<bool>(input, "failOnError");
     // Density for vector-based input
     if (HasAttr(input, "density")) {
-      descriptor->density = AttrTo<uint32_t>(input, "density");
+      descriptor->density = AttrTo<double>(input, "density");
     }
     // Raw pixel input
     if (HasAttr(input, "rawChannels")) {
@@ -63,7 +72,10 @@ namespace sharp {
       descriptor->rawWidth = AttrTo<uint32_t>(input, "rawWidth");
       descriptor->rawHeight = AttrTo<uint32_t>(input, "rawHeight");
     }
-    // Page input for multi-page TIFF
+    // Multi-page input (GIF, TIFF, PDF)
+    if (HasAttr(input, "pages")) {
+      descriptor->pages = AttrTo<int32_t>(input, "pages");
+    }
     if (HasAttr(input, "page")) {
       descriptor->page = AttrTo<uint32_t>(input, "page");
     }
@@ -72,10 +84,7 @@ namespace sharp {
       descriptor->createChannels = AttrTo<uint32_t>(input, "createChannels");
       descriptor->createWidth = AttrTo<uint32_t>(input, "createWidth");
       descriptor->createHeight = AttrTo<uint32_t>(input, "createHeight");
-      v8::Local<v8::Object> createBackground = AttrAs<v8::Object>(input, "createBackground");
-      for (unsigned int i = 0; i < 4; i++) {
-        descriptor->createBackground[i] = AttrTo<double>(createBackground, i);
-      }
+      descriptor->createBackground = AttrAsRgba(input, "createBackground");
     }
     return descriptor;
   }
@@ -102,6 +111,15 @@ namespace sharp {
   bool IsTiff(std::string const &str) {
     return EndsWith(str, ".tif") || EndsWith(str, ".tiff") || EndsWith(str, ".TIF") || EndsWith(str, ".TIFF");
   }
+  bool IsHeic(std::string const &str) {
+    return EndsWith(str, ".heic") || EndsWith(str, ".HEIC");
+  }
+  bool IsHeif(std::string const &str) {
+    return EndsWith(str, ".heif") || EndsWith(str, ".HEIF") || IsHeic(str) || IsAvif(str);
+  }
+  bool IsAvif(std::string const &str) {
+    return EndsWith(str, ".avif") || EndsWith(str, ".AVIF");
+  }
   bool IsDz(std::string const &str) {
     return EndsWith(str, ".dzi") || EndsWith(str, ".DZI");
   }
@@ -124,14 +142,16 @@ namespace sharp {
       case ImageType::TIFF: id = "tiff"; break;
       case ImageType::GIF: id = "gif"; break;
       case ImageType::SVG: id = "svg"; break;
+      case ImageType::HEIF: id = "heif"; break;
       case ImageType::PDF: id = "pdf"; break;
       case ImageType::MAGICK: id = "magick"; break;
       case ImageType::OPENSLIDE: id = "openslide"; break;
       case ImageType::PPM: id = "ppm"; break;
       case ImageType::FITS: id = "fits"; break;
-      case ImageType::VIPS: id = "v"; break;
+      case ImageType::VIPS: id = "vips"; break;
       case ImageType::RAW: id = "raw"; break;
       case ImageType::UNKNOWN: id = "unknown"; break;
+      case ImageType::MISSING: id = "missing"; break;
     }
     return id;
   }
@@ -156,6 +176,8 @@ namespace sharp {
         imageType = ImageType::GIF;
       } else if (EndsWith(loader, "SvgBuffer")) {
         imageType = ImageType::SVG;
+      } else if (EndsWith(loader, "HeifBuffer")) {
+        imageType = ImageType::HEIF;
       } else if (EndsWith(loader, "PdfBuffer")) {
         imageType = ImageType::PDF;
       } else if (EndsWith(loader, "MagickBuffer")) {
@@ -187,6 +209,8 @@ namespace sharp {
         imageType = ImageType::GIF;
       } else if (EndsWith(loader, "SvgFile")) {
         imageType = ImageType::SVG;
+      } else if (EndsWith(loader, "HeifFile")) {
+        imageType = ImageType::HEIF;
       } else if (EndsWith(loader, "PdfFile")) {
         imageType = ImageType::PDF;
       } else if (EndsWith(loader, "Ppm")) {
@@ -198,8 +222,23 @@ namespace sharp {
       } else if (EndsWith(loader, "Magick") || EndsWith(loader, "MagickFile")) {
         imageType = ImageType::MAGICK;
       }
+    } else {
+      if (EndsWith(vips::VError().what(), " not found\n")) {
+        imageType = ImageType::MISSING;
+      }
     }
     return imageType;
+  }
+
+  /*
+    Does this image type support multiple pages?
+  */
+  bool ImageTypeSupportsPage(ImageType imageType) {
+    return
+      imageType == ImageType::GIF ||
+      imageType == ImageType::TIFF ||
+      imageType == ImageType::HEIF ||
+      imageType == ImageType::PDF;
   }
 
   /*
@@ -208,7 +247,7 @@ namespace sharp {
   std::tuple<VImage, ImageType> OpenInput(InputDescriptor *descriptor, VipsAccess accessMethod) {
     VImage image;
     ImageType imageType;
-    if (descriptor->buffer != nullptr) {
+    if (descriptor->isBuffer) {
       if (descriptor->rawChannels > 0) {
         // Raw, uncompressed pixel data
         image = VImage::new_from_memory(descriptor->buffer, descriptor->bufferLength,
@@ -228,20 +267,21 @@ namespace sharp {
               ->set("access", accessMethod)
               ->set("fail", descriptor->failOnError);
             if (imageType == ImageType::SVG || imageType == ImageType::PDF) {
-              option->set("dpi", static_cast<double>(descriptor->density));
+              option->set("dpi", descriptor->density);
             }
             if (imageType == ImageType::MAGICK) {
               option->set("density", std::to_string(descriptor->density).data());
             }
-            if (imageType == ImageType::TIFF) {
-             option->set("page", descriptor->page);
+            if (ImageTypeSupportsPage(imageType)) {
+              option->set("n", descriptor->pages);
+              option->set("page", descriptor->page);
             }
             image = VImage::new_from_buffer(descriptor->buffer, descriptor->bufferLength, nullptr, option);
             if (imageType == ImageType::SVG || imageType == ImageType::PDF || imageType == ImageType::MAGICK) {
-              SetDensity(image, descriptor->density);
+              image = SetDensity(image, descriptor->density);
             }
-          } catch (...) {
-            throw vips::VError("Input buffer has corrupt header");
+          } catch (vips::VError const &err) {
+            throw vips::VError(std::string("Input buffer has corrupt header: ") + err.what());
           }
         } else {
           throw vips::VError("Input buffer contains unsupported image format");
@@ -264,29 +304,33 @@ namespace sharp {
       } else {
         // From filesystem
         imageType = DetermineImageType(descriptor->file.data());
+        if (imageType == ImageType::MISSING) {
+          throw vips::VError("Input file is missing");
+        }
         if (imageType != ImageType::UNKNOWN) {
           try {
             vips::VOption *option = VImage::option()
               ->set("access", accessMethod)
               ->set("fail", descriptor->failOnError);
             if (imageType == ImageType::SVG || imageType == ImageType::PDF) {
-              option->set("dpi", static_cast<double>(descriptor->density));
+              option->set("dpi", descriptor->density);
             }
             if (imageType == ImageType::MAGICK) {
               option->set("density", std::to_string(descriptor->density).data());
             }
-            if (imageType == ImageType::TIFF) {
-             option->set("page", descriptor->page);
+            if (ImageTypeSupportsPage(imageType)) {
+              option->set("n", descriptor->pages);
+              option->set("page", descriptor->page);
             }
             image = VImage::new_from_file(descriptor->file.data(), option);
             if (imageType == ImageType::SVG || imageType == ImageType::PDF || imageType == ImageType::MAGICK) {
-              SetDensity(image, descriptor->density);
+              image = SetDensity(image, descriptor->density);
             }
-          } catch (...) {
-            throw vips::VError("Input file has corrupt header");
+          } catch (vips::VError const &err) {
+            throw vips::VError(std::string("Input file has corrupt header: ") + err.what());
           }
         } else {
-          throw vips::VError("Input file is missing or of an unsupported image format");
+          throw vips::VError("Input file contains unsupported image format");
         }
       }
     }
@@ -327,15 +371,19 @@ namespace sharp {
   /*
     Set EXIF Orientation of image.
   */
-  void SetExifOrientation(VImage image, int const orientation) {
-    image.set(VIPS_META_ORIENTATION, orientation);
+  VImage SetExifOrientation(VImage image, int const orientation) {
+    VImage copy = image.copy();
+    copy.set(VIPS_META_ORIENTATION, orientation);
+    return copy;
   }
 
   /*
     Remove EXIF Orientation from image.
   */
-  void RemoveExifOrientation(VImage image) {
-    vips_image_remove(image.get_image(), VIPS_META_ORIENTATION);
+  VImage RemoveExifOrientation(VImage image) {
+    VImage copy = image.copy();
+    copy.remove(VIPS_META_ORIENTATION);
+    return copy;
   }
 
   /*
@@ -355,11 +403,13 @@ namespace sharp {
   /*
     Set pixels/mm resolution based on a pixels/inch density.
   */
-  void SetDensity(VImage image, const int density) {
-    const double pixelsPerMm = static_cast<double>(density) / 25.4;
-    image.set("Xres", pixelsPerMm);
-    image.set("Yres", pixelsPerMm);
-    image.set(VIPS_META_RESOLUTION_UNIT, "in");
+  VImage SetDensity(VImage image, const double density) {
+    const double pixelsPerMm = density / 25.4;
+    VImage copy = image.copy();
+    copy.set("Xres", pixelsPerMm);
+    copy.set("Yres", pixelsPerMm);
+    copy.set(VIPS_META_RESOLUTION_UNIT, "in");
+    return copy;
   }
 
   /*
@@ -369,10 +419,6 @@ namespace sharp {
     if (imageType == ImageType::JPEG) {
       if (image.width() > 65535 || image.height() > 65535) {
         throw vips::VError("Processed image is too large for the JPEG format");
-      }
-    } else if (imageType == ImageType::PNG) {
-      if (image.width() > 2147483647 || image.height() > 2147483647) {
-        throw vips::VError("Processed image is too large for the PNG format");
       }
     } else if (imageType == ImageType::WEBP) {
       if (image.width() > 16383 || image.height() > 16383) {
@@ -604,6 +650,42 @@ namespace sharp {
       pixel = pixel.colourspace(interpretation, VImage::option()->set("source_space", VIPS_INTERPRETATION_sRGB));
       return pixel(0, 0);
     }
+  }
+
+  /*
+    Apply the alpha channel to a given colour
+  */
+  std::tuple<VImage, std::vector<double>> ApplyAlpha(VImage image, std::vector<double> colour) {
+    // Scale up 8-bit values to match 16-bit input image
+    double const multiplier = sharp::Is16Bit(image.interpretation()) ? 256.0 : 1.0;
+    // Create alphaColour colour
+    std::vector<double> alphaColour;
+    if (image.bands() > 2) {
+      alphaColour = {
+        multiplier * colour[0],
+        multiplier * colour[1],
+        multiplier * colour[2]
+      };
+    } else {
+      // Convert sRGB to greyscale
+      alphaColour = { multiplier * (
+        0.2126 * colour[0] +
+        0.7152 * colour[1] +
+        0.0722 * colour[2])
+      };
+    }
+    // Add alpha channel to alphaColour colour
+    if (colour[3] < 255.0 || HasAlpha(image)) {
+      alphaColour.push_back(colour[3] * multiplier);
+    }
+    // Ensure alphaColour colour uses correct colourspace
+    alphaColour = sharp::GetRgbaAsColourspace(alphaColour, image.interpretation());
+    // Add non-transparent alpha channel, if required
+    if (colour[3] < 255.0 && !HasAlpha(image)) {
+      image = image.bandjoin(
+        VImage::new_matrix(image.width(), image.height()).new_from_image(255 * multiplier));
+    }
+    return std::make_tuple(image, alphaColour);
   }
 
 }  // namespace sharp

@@ -97,7 +97,8 @@
         'conditions': [
           ['OS == "win"', {
             'defines': [
-              '_ALLOW_KEYWORD_MACROS'
+              '_ALLOW_KEYWORD_MACROS',
+              '_FILE_OFFSET_BITS=64'
             ],
             'libraries': [
               '../vendor/lib/libvips.lib',
@@ -128,9 +129,11 @@
               '../vendor/lib/libcairo.so',
               '../vendor/lib/libcroco-0.6.so',
               '../vendor/lib/libexif.so',
+              '../vendor/lib/libexpat.so',
               '../vendor/lib/libffi.so',
               '../vendor/lib/libfontconfig.so',
               '../vendor/lib/libfreetype.so',
+              '../vendor/lib/libfribidi.so',
               '../vendor/lib/libgdk_pixbuf-2.0.so',
               '../vendor/lib/libgif.so',
               '../vendor/lib/libgio-2.0.so',
@@ -149,6 +152,8 @@
               '../vendor/lib/librsvg-2.so',
               '../vendor/lib/libtiff.so',
               '../vendor/lib/libwebp.so',
+              '../vendor/lib/libwebpdemux.so',
+              '../vendor/lib/libwebpmux.so',
               '../vendor/lib/libxml2.so',
               '../vendor/lib/libz.so',
               # Ensure runtime linking is relative to sharp.node
@@ -178,13 +183,22 @@
     },
     'configurations': {
       'Release': {
-        'msvs_settings': {
-          'VCCLCompilerTool': {
-            'ExceptionHandling': 1
-          }
-        },
-        'msvs_disabled_warnings': [
-          4275
+        'conditions': [
+          ['OS == "linux"', {
+            'cflags_cc': [
+              '-Wno-cast-function-type'
+            ]
+          }],
+          ['OS == "win"', {
+            'msvs_settings': {
+              'VCCLCompilerTool': {
+                'ExceptionHandling': 1
+              }
+            },
+            'msvs_disabled_warnings': [
+              4275
+            ]
+          }]
         ]
       }
     },

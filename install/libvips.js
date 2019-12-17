@@ -15,7 +15,34 @@ const libvips = require('../lib/libvips');
 const platform = require('../lib/platform');
 
 const minimumLibvipsVersion = libvips.minimumLibvipsVersion;
-const distBaseUrl = process.env.SHARP_DIST_BASE_URL || `https://github.com/lovell/sharp-libvips/releases/download/v${minimumLibvipsVersion}/`;
+const distBaseUrl = process.env.npm_config_sharp_dist_base_url || process.env.SHARP_DIST_BASE_URL || `https://github.com/lovell/sharp-libvips/releases/download/v${minimumLibvipsVersion}/`;
+
+const fail = function (err) {
+  npmLog.error('sharp', err.message);
+  if (err.code === 'EACCES') {
+    npmLog.info('sharp', 'Are you trying to install as a root or sudo user? Try again with the --unsafe-perm flag');
+  }
+  npmLog.info('sharp', 'Attempting to build from source via node-gyp but this may fail due to the above error');
+  npmLog.info('sharp', 'Please see https://sharp.pixelplumbing.com/page/install for required dependencies');
+  process.exit(1);
+};
+
+const extractTarball = function (tarPath) {
+  const vendorPath = path.join(__dirname, '..', 'vendor');
+  libvips.mkdirSync(vendorPath);
+  tar
+    .extract({
+      file: tarPath,
+      cwd: vendorPath,
+      strict: true
+    })
+    .catch(function (err) {
+      if (/unexpected end of file/.test(err.message)) {
+        npmLog.error('sharp', `Please delete ${tarPath} as it is not a valid tarball`);
+      }
+      fail(err);
+    });
+};
 
 try {
   const useGlobalLibvips = libvips.useGlobalLibvips();
@@ -29,54 +56,58 @@ try {
   } else {
     // Is this arch/platform supported?
     const arch = process.env.npm_config_arch || process.arch;
-    if (platform() === 'win32-ia32') {
+    const platformAndArch = platform();
+    if (platformAndArch === 'win32-ia32') {
       throw new Error('Windows x86 (32-bit) node.exe is not supported');
     }
     if (arch === 'ia32') {
-      throw new Error(`Intel Architecture 32-bit systems require manual installation of libvips >= ${minimumLibvipsVersion}\n`);
+      throw new Error(`Intel Architecture 32-bit systems require manual installation of libvips >= ${minimumLibvipsVersion}`);
     }
-    if (detectLibc.isNonGlibcLinux) {
-      throw new Error(`Use with ${detectLibc.family} libc requires manual installation of libvips >= ${minimumLibvipsVersion}`);
+    if (platformAndArch === 'freebsd-x64' || platformAndArch === 'openbsd-x64' || platformAndArch === 'sunos-x64') {
+      throw new Error(`BSD/SunOS systems require manual installation of libvips >= ${minimumLibvipsVersion}`);
     }
-    if (detectLibc.family === detectLibc.GLIBC && detectLibc.version && semver.lt(`${detectLibc.version}.0`, '2.13.0')) {
+    if (detectLibc.family === detectLibc.GLIBC && detectLibc.version && semver.lt(`${detectLibc.version}.0`, '2.17.0')) {
       throw new Error(`Use with glibc version ${detectLibc.version} requires manual installation of libvips >= ${minimumLibvipsVersion}`);
     }
     // Download to per-process temporary file
-    const tarFilename = ['libvips', minimumLibvipsVersion, platform()].join('-') + '.tar.gz';
-    const tarPathTemp = path.join(os.tmpdir(), `${process.pid}-${tarFilename}`);
-    const tmpFile = fs.createWriteStream(tarPathTemp);
-    const url = distBaseUrl + tarFilename;
-    npmLog.info('sharp', `Downloading ${url}`);
-    simpleGet({ url: url, agent: agent() }, function (err, response) {
-      if (err) {
-        throw err;
-      }
-      if (response.statusCode !== 200) {
-        throw new Error(`Status ${response.statusCode}`);
-      }
-      response.pipe(tmpFile);
-    });
-    tmpFile.on('close', function () {
-      const vendorPath = path.join(__dirname, '..', 'vendor');
-      fs.mkdirSync(vendorPath);
-      tar
-        .extract({
-          file: tarPathTemp,
-          cwd: vendorPath,
-          strict: true
-        })
-        .then(function () {
+    const tarFilename = ['libvips', minimumLibvipsVersion, platformAndArch].join('-') + '.tar.gz';
+    const tarPathCache = path.join(libvips.cachePath(), tarFilename);
+    if (fs.existsSync(tarPathCache)) {
+      npmLog.info('sharp', `Using cached ${tarPathCache}`);
+      extractTarball(tarPathCache);
+    } else {
+      const tarPathTemp = path.join(os.tmpdir(), `${process.pid}-${tarFilename}`);
+      const tmpFile = fs.createWriteStream(tarPathTemp);
+      const url = distBaseUrl + tarFilename;
+      npmLog.info('sharp', `Downloading ${url}`);
+      simpleGet({ url: url, agent: agent() }, function (err, response) {
+        if (err) {
+          fail(err);
+        } else if (response.statusCode === 404) {
+          fail(new Error(`Prebuilt libvips binaries are not yet available for ${platformAndArch}`));
+        } else if (response.statusCode !== 200) {
+          fail(new Error(`Status ${response.statusCode} ${response.statusMessage}`));
+        } else {
+          response
+            .on('error', fail)
+            .pipe(tmpFile);
+        }
+      });
+      tmpFile
+        .on('error', fail)
+        .on('close', function () {
           try {
+            // Attempt to rename
+            fs.renameSync(tarPathTemp, tarPathCache);
+          } catch (err) {
+            // Fall back to copy and unlink
+            fs.copyFileSync(tarPathTemp, tarPathCache);
             fs.unlinkSync(tarPathTemp);
-          } catch (err) {}
-        })
-        .catch(function (err) {
-          throw err;
+          }
+          extractTarball(tarPathCache);
         });
-    });
+    }
   }
 } catch (err) {
-  npmLog.error('sharp', err.message);
-  npmLog.error('sharp', 'Please see http://sharp.pixelplumbing.com/page/install');
-  process.exit(1);
+  fail(err);
 }
