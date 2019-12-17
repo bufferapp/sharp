@@ -310,22 +310,24 @@ class PipelineWorker : public Nan::AsyncWorker {
         }
       }
 
-      // Ensure we're using a device-independent colour space
-      if (sharp::HasProfile(image) && image.interpretation() != VIPS_INTERPRETATION_LABS) {
-        // Convert to sRGB using embedded profile
-        try {
-          image = image.icc_transform("srgb", VImage::option()
-            ->set("embedded", TRUE)
-            ->set("intent", VIPS_INTENT_PERCEPTUAL));
-        } catch(...) {
-          // Ignore failure of embedded profile
-        }
-      } else if (image.interpretation() == VIPS_INTERPRETATION_CMYK) {
-        image = image.icc_transform("srgb", VImage::option()
-          ->set("input_profile", "cmyk")
-          ->set("intent", VIPS_INTENT_PERCEPTUAL));
-      }
 
+      if (!baton->keepExistingProfile) {
+        // Ensure we're using a device-independent colour space
+        if (sharp::HasProfile(image) && image.interpretation() != VIPS_INTERPRETATION_LABS) {
+          // Convert to sRGB using embedded profile
+          try {
+            image = image.icc_transform("srgb", VImage::option()
+              ->set("embedded", TRUE)
+              ->set("intent", VIPS_INTENT_PERCEPTUAL));
+          } catch(...) {
+            // Ignore failure of embedded profile
+          }
+        } else if (image.interpretation() == VIPS_INTERPRETATION_CMYK) {
+          image = image.icc_transform("srgb", VImage::option()
+            ->set("input_profile", "cmyk")
+            ->set("intent", VIPS_INTENT_PERCEPTUAL));
+        }
+      }
       // Flatten image to remove alpha channel
       if (baton->flatten && HasAlpha(image)) {
         // Scale up 8-bit values to match 16-bit input image
